@@ -1,490 +1,505 @@
 import streamlit as st
 import pandas as pd
+import datetime
 import plotly.express as px
-from datetime import datetime, timedelta
 import json
-import os
+from collections import defaultdict
+import requests
+from github import Github
+from github.InputFileContent import InputFileContent
 
-# Set page config
+# Set page configuration
 st.set_page_config(page_title="Habit Tracker", layout="wide")
 
-# Initialize session state variables if they don't exist
-if 'habits' not in st.session_state:
-    st.session_state.habits = []
-if 'logs' not in st.session_state:
-    st.session_state.logs = []
-if 'activities' not in st.session_state:
-    st.session_state.activities = []
+# GitHub Gist functionality
+def initialize_github_connection():
+    if 'github' not in st.session_state:
+        if 'github_token' in st.session_state:
+            try:
+                st.session_state.github = Github(st.session_state.github_token)
+                return True
+            except Exception as e:
+                st.error(f"Error connecting to GitHub: {e}")
+                return False
+        return False
+    return True
 
-# File operations for data persistence
-DATA_DIR = "data"
-HABITS_FILE = os.path.join(DATA_DIR, "habits.json")
-LOGS_FILE = os.path.join(DATA_DIR, "logs.json")
-ACTIVITIES_FILE = os.path.join(DATA_DIR, "activities.json")
-
-def save_data():
-    """Save all data to JSON files"""
-    os.makedirs(DATA_DIR, exist_ok=True)
+def get_or_create_gist(filename, description="Habit Tracker Data"):
+    """Get an existing gist or create a new one."""
+    if not initialize_github_connection():
+        return None
     
-    with open(HABITS_FILE, 'w') as f:
-        json.dump(st.session_state.habits, f)
+    # First, try to find an existing gist with our file
+    user = st.session_state.github.get_user()
     
-    with open(LOGS_FILE, 'w') as f:
-        json.dump(st.session_state.logs, f)
-        
-    with open(ACTIVITIES_FILE, 'w') as f:
-        json.dump(st.session_state.activities, f)
-
-def load_data():
-    """Load data from JSON files if they exist"""
+    for gist in user.get_gists():
+        if filename in gist.files:
+            return gist
+    
+    # If not found, create a new gist
+    file_content = "{}"
+    files = {filename: InputFileContent(file_content)}
+    
     try:
-        if os.path.exists(HABITS_FILE):
-            with open(HABITS_FILE, 'r') as f:
-                st.session_state.habits = json.load(f)
-        
-        if os.path.exists(LOGS_FILE):
-            with open(LOGS_FILE, 'r') as f:
-                st.session_state.logs = json.load(f)
-                
-        if os.path.exists(ACTIVITIES_FILE):
-            with open(ACTIVITIES_FILE, 'r') as f:
-                st.session_state.activities = json.load(f)
+        new_gist = user.create_gist(True, files, description)
+        return new_gist
     except Exception as e:
-        st.error(f"Error loading data: {e}")
+        st.error(f"Error creating gist: {e}")
+        return None
 
-# Load data at startup
-load_data()
-
-# App title and sidebar
-st.title("📊 Habit Tracker")
-
-# Sidebar navigation
-page = st.sidebar.selectbox("Select Page", ["Manage Habits", "Track Habits", "View Statistics", "One-time Activities"])
-
-if page == "Manage Habits":
-    st.header("Manage Your Habits")
+def load_from_gist(filename):
+    """Load data from a GitHub Gist."""
+    if not initialize_github_connection():
+        return None
     
-    # Add new habit form
-    with st.form("new_habit_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            habit_name = st.text_input("Habit Name")
-        with col2:
-            frequency = st.selectbox("Frequency", ["Daily", "Weekly"])
-        
-        description = st.text_area("Description (Optional)")
-        
-        submit_button = st.form_submit_button("Add Habit")
-        
-        if submit_button and habit_name:
-            # Check if habit already exists
-            if any(h["name"] == habit_name for h in st.session_state.habits):
-                st.error(f"Habit '{habit_name}' already exists!")
-            else:
-                new_habit = {
-                    "id": len(st.session_state.habits) + 1,
-                    "name": habit_name,
-                    "frequency": frequency,
-                    "description": description,
-                    "created_at": datetime.now().strftime("%Y-%m-%d")
-                }
-                st.session_state.habits.append(new_habit)
-                save_data()
-                st.success(f"Habit '{habit_name}' added successfully!")
+    gist = get_or_create_gist(filename)
+    if gist:
+        file_content = gist.files[filename].content
+        return json.loads(file_content)
     
-    # Display existing habits
-    if st.session_state.habits:
-        st.subheader("Your Habits")
-        habit_df = pd.DataFrame(st.session_state.habits)
-        
-        # Format for display
-        display_cols = ["name", "frequency", "description", "created_at"]
-        habit_df = habit_df[display_cols].rename(columns={
-            "name": "Habit Name",
-            "frequency": "Frequency",
-            "description": "Description",
-            "created_at": "Created At"
-        })
-        
-        st.dataframe(habit_df, use_container_width=True)
-        
-        # Delete habit functionality
-        habit_to_delete = st.selectbox("Select habit to delete", 
-                                      [h["name"] for h in st.session_state.habits],
-                                      index=None)
-        if st.button("Delete Selected Habit") and habit_to_delete:
-            # Remove the habit
-            habit_id = next((h["id"] for h in st.session_state.habits if h["name"] == habit_to_delete), None)
-            st.session_state.habits = [h for h in st.session_state.habits if h["name"] != habit_to_delete]
-            
-            # Remove associated logs
-            if habit_id:
-                st.session_state.logs = [log for log in st.session_state.logs if log["habit_id"] != habit_id]
-            
-            save_data()
-            st.success(f"Habit '{habit_to_delete}' deleted successfully!")
-            st.experimental_rerun()
-    else:
-        st.info("No habits added yet. Add your first habit using the form above.")
+    return None
 
-elif page == "Track Habits":
+def save_to_gist(data, filename):
+    """Save data to a GitHub Gist."""
+    if not initialize_github_connection():
+        return False
+    
+    gist = get_or_create_gist(filename)
+    if gist:
+        gist.edit(files={filename: InputFileContent(json.dumps(data, indent=2))})
+        return True
+    
+    return False
+
+# Function to load habits
+def load_habits():
+    if initialize_github_connection():
+        habits = load_from_gist("habits.json")
+        if habits:
+            return habits
+    
+    # Default habits structure
+    return {
+        "daily": [],
+        "weekly": [],
+        "one_time": []
+    }
+
+# Function to save habits
+def save_habits(habits):
+    save_to_gist(habits, "habits.json")
+
+# Function to load logs
+def load_logs():
+    if initialize_github_connection():
+        logs = load_from_gist("logs.json")
+        if logs:
+            return logs
+    
+    return []
+
+# Function to save logs
+def save_logs(logs):
+    save_to_gist(logs, "logs.json")
+
+# Function to log a habit
+def log_habit(habit_name, date, notes=""):
+    logs = load_logs()
+    logs.append({
+        "habit": habit_name,
+        "date": date,
+        "notes": notes,
+        "timestamp": datetime.datetime.now().isoformat()
+    })
+    save_logs(logs)
+
+# GitHub authentication
+if "github_token" not in st.session_state:
+    st.sidebar.title("GitHub Authentication")
+    st.sidebar.info("This app uses GitHub Gists to store your habit data. Please enter your GitHub Personal Access Token to continue.")
+    st.sidebar.markdown("""
+    To create a token:
+    1. Go to [GitHub Settings > Developer Settings > Personal Access Tokens](https://github.com/settings/tokens)
+    2. Generate a new token with 'gist' scope
+    """)
+    
+    github_token = st.sidebar.text_input("GitHub Personal Access Token", type="password")
+    
+    if st.sidebar.button("Connect to GitHub"):
+        if github_token:
+            st.session_state.github_token = github_token
+            try:
+                # Test the connection
+                g = Github(github_token)
+                user = g.get_user()
+                st.session_state.github = g
+                st.sidebar.success(f"Connected to GitHub as {user.login}")
+                st.experimental_rerun()
+            except Exception as e:
+                st.sidebar.error(f"Error connecting to GitHub: {e}")
+        else:
+            st.sidebar.error("Please enter a token")
+
+# Initialize session state for habits and active tab
+if 'habits' not in st.session_state and initialize_github_connection():
+    st.session_state.habits = load_habits()
+
+if not initialize_github_connection():
+    st.warning("Please connect to GitHub using the sidebar to use this app.")
+    st.stop()
+
+# App header
+st.title("Habit Tracker")
+
+# Main navigation tabs
+tabs = st.tabs(["Track", "Add Habits", "Analytics"])
+
+# Track habits tab
+with tabs[0]:
     st.header("Track Your Habits")
     
-    if not st.session_state.habits:
-        st.info("No habits to track. Please add habits first.")
+    # Get today's date
+    today = datetime.date.today().isoformat()
+    track_date = st.date_input("Date to track", datetime.date.today())
+    date_str = track_date.isoformat()
+    
+    st.subheader("Daily Habits")
+    if not st.session_state.habits["daily"]:
+        st.info("No daily habits added yet. Go to 'Add Habits' tab to add some!")
     else:
-        # Current date for tracking
-        today = datetime.now().strftime("%Y-%m-%d")
+        logs = load_logs()
+        completed_today = {log["habit"] for log in logs if log["date"] == date_str}
         
-        st.subheader(f"Track for {today}")
-        
-        # Filter habits based on frequency and today's day
-        day_of_week = datetime.now().weekday()  # Monday is 0, Sunday is 6
-        
-        daily_habits = [h for h in st.session_state.habits if h["frequency"] == "Daily"]
-        weekly_habits = [h for h in st.session_state.habits if h["frequency"] == "Weekly"]
-        
-        # Daily habits tracking
-        if daily_habits:
-            st.write("### Daily Habits")
+        for habit in st.session_state.habits["daily"]:
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.write(habit)
+            with col2:
+                if st.button("✓", key=f"daily_{habit}"):
+                    log_habit(habit, date_str)
+                    st.success(f"Logged {habit}")
+                    st.experimental_rerun()
             
-            # Check for existing logs today for each habit
-            for habit in daily_habits:
-                habit_id = habit["id"]
-                habit_name = habit["name"]
-                
-                # Check if already logged today
-                already_logged = any(
-                    log["habit_id"] == habit_id and log["date"] == today 
-                    for log in st.session_state.logs
-                )
-                
-                col1, col2, col3 = st.columns([2, 1, 1])
-                with col1:
-                    st.write(f"**{habit_name}**")
-                
-                with col2:
-                    if already_logged:
-                        st.success("Completed")
-                    else:
-                        st.error("Not Completed")
-                
-                with col3:
-                    # Allow toggling completion status
-                    if st.button("Toggle", key=f"toggle_{habit_id}"):
-                        if already_logged:
-                            # Remove the log
-                            st.session_state.logs = [
-                                log for log in st.session_state.logs 
-                                if not (log["habit_id"] == habit_id and log["date"] == today)
-                            ]
-                        else:
-                            # Add new log
-                            new_log = {
-                                "id": len(st.session_state.logs) + 1,
-                                "habit_id": habit_id,
-                                "date": today,
-                                "completed": True
-                            }
-                            st.session_state.logs.append(new_log)
-                        
-                        save_data()
-                        st.experimental_rerun()
-        
-        # Weekly habits tracking
-        if weekly_habits:
-            st.write("### Weekly Habits")
-            
-            for habit in weekly_habits:
-                habit_id = habit["id"]
-                habit_name = habit["name"]
-                
-                # Check for logs in the current week
-                current_week_start = (datetime.now() - timedelta(days=day_of_week)).strftime("%Y-%m-%d")
-                current_week_end = (datetime.now() + timedelta(days=6-day_of_week)).strftime("%Y-%m-%d")
-                
-                already_logged_this_week = any(
-                    log["habit_id"] == habit_id and 
-                    current_week_start <= log["date"] <= current_week_end
-                    for log in st.session_state.logs
-                )
-                
-                col1, col2, col3 = st.columns([2, 1, 1])
-                with col1:
-                    st.write(f"**{habit_name}**")
-                
-                with col2:
-                    if already_logged_this_week:
-                        st.success("Completed this week")
-                    else:
-                        st.error("Not completed this week")
-                
-                with col3:
-                    if st.button("Toggle", key=f"toggle_weekly_{habit_id}"):
-                        if already_logged_this_week:
-                            # Remove the log from this week
-                            st.session_state.logs = [
-                                log for log in st.session_state.logs 
-                                if not (log["habit_id"] == habit_id and 
-                                       current_week_start <= log["date"] <= current_week_end)
-                            ]
-                        else:
-                            # Add new log for today
-                            new_log = {
-                                "id": len(st.session_state.logs) + 1,
-                                "habit_id": habit_id,
-                                "date": today,
-                                "completed": True
-                            }
-                            st.session_state.logs.append(new_log)
-                        
-                        save_data()
-                        st.experimental_rerun()
-
-elif page == "View Statistics":
-    st.header("Habit Statistics")
+            # Show if already completed today
+            if habit in completed_today:
+                st.success("Completed today! ✓")
     
-    if not st.session_state.habits or not st.session_state.logs:
-        st.info("No data to analyze yet. Start tracking your habits first!")
+    st.subheader("Weekly Habits")
+    if not st.session_state.habits["weekly"]:
+        st.info("No weekly habits added yet. Go to 'Add Habits' tab to add some!")
     else:
-        # Time period selector
-        period = st.selectbox("Select Time Period", ["Week", "Month", "Year", "All Time"])
+        logs = load_logs()
+        completed_this_week = set()
         
-        # Calculate date ranges based on selected period
-        today = datetime.now()
+        # Get the start of the current week (Monday)
+        today_date = datetime.date.fromisoformat(date_str)
+        start_of_week = today_date - datetime.timedelta(days=today_date.weekday())
+        end_of_week = start_of_week + datetime.timedelta(days=6)
         
-        if period == "Week":
-            start_date = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
-            end_date = (today + timedelta(days=6-today.weekday())).strftime("%Y-%m-%d")
-            title = f"This Week ({start_date} to {end_date})"
-        elif period == "Month":
-            start_date = today.replace(day=1).strftime("%Y-%m-%d")
-            # Last day of current month
-            if today.month == 12:
-                last_day = today.replace(year=today.year+1, month=1, day=1) - timedelta(days=1)
-            else:
-                last_day = today.replace(month=today.month+1, day=1) - timedelta(days=1)
-            end_date = last_day.strftime("%Y-%m-%d")
-            title = f"This Month ({start_date} to {end_date})"
-        elif period == "Year":
-            start_date = today.replace(month=1, day=1).strftime("%Y-%m-%d")
-            end_date = today.replace(month=12, day=31).strftime("%Y-%m-%d")
-            title = f"This Year ({start_date} to {end_date})"
-        else:  # All Time
-            start_date = "2000-01-01"  # Arbitrary past date
-            end_date = "2099-12-31"    # Arbitrary future date
-            title = "All Time"
+        for log in logs:
+            try:
+                log_date = datetime.date.fromisoformat(log["date"])
+                if start_of_week <= log_date <= end_of_week:
+                    completed_this_week.add(log["habit"])
+            except:
+                pass
         
-        # Convert logs to DataFrame for analysis
-        logs_df = pd.DataFrame(st.session_state.logs)
-        
-        if not logs_df.empty:
-            # Filter logs by date range
-            filtered_logs = logs_df[
-                (logs_df["date"] >= start_date) & 
-                (logs_df["date"] <= end_date)
-            ]
+        for habit in st.session_state.habits["weekly"]:
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.write(habit)
+            with col2:
+                if st.button("✓", key=f"weekly_{habit}"):
+                    log_habit(habit, date_str)
+                    st.success(f"Logged {habit}")
+                    st.experimental_rerun()
             
-            habits_df = pd.DataFrame(st.session_state.habits)
-            
-            # Join habits with logs to get habit names
-            if not filtered_logs.empty and not habits_df.empty:
-                # Count completions by habit
-                habit_counts = filtered_logs["habit_id"].value_counts().reset_index()
-                habit_counts.columns = ["habit_id", "completions"]
+            # Show if already completed this week
+            if habit in completed_this_week:
+                st.success("Completed this week! ✓")
                 
-                # Merge with habit names
-                habit_stats = pd.merge(
-                    habit_counts, 
-                    habits_df[["id", "name", "frequency"]], 
-                    left_on="habit_id", 
-                    right_on="id",
-                    how="left"
-                )
-                
-                # Display summary statistics
-                st.subheader(f"Habit Completion Summary - {title}")
-                
-                # Bar chart of completions
-                fig = px.bar(
-                    habit_stats, 
-                    x="name", 
-                    y="completions",
-                    color="frequency",
-                    title="Habit Completions",
-                    labels={"name": "Habit", "completions": "Number of Completions", "frequency": "Frequency"}
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Detailed table with stats
-                st.subheader("Detailed Statistics")
-                
-                # Calculate streak for each habit
-                habit_streaks = {}
-                for habit in st.session_state.habits:
-                    habit_id = habit["id"]
-                    habit_logs = logs_df[logs_df["habit_id"] == habit_id].sort_values("date")
-                    
-                    if not habit_logs.empty:
-                        # Calculate current streak
-                        dates = pd.to_datetime(habit_logs["date"])
-                        
-                        # For daily habits
-                        if habit["frequency"] == "Daily":
-                            # Convert to datetime for date math
-                            dates = pd.to_datetime(habit_logs["date"])
-                            
-                            # Check if there's a log for today
-                            has_today = datetime.now().strftime("%Y-%m-%d") in habit_logs["date"].values
-                            
-                            if has_today:
-                                # Count backwards from today
-                                streak = 1
-                                current_date = datetime.now().date()
-                                
-                                while True:
-                                    prev_date = (current_date - timedelta(days=1))
-                                    prev_date_str = prev_date.strftime("%Y-%m-%d")
-                                    
-                                    if prev_date_str in habit_logs["date"].values:
-                                        streak += 1
-                                        current_date = prev_date
-                                    else:
-                                        break
-                                
-                                habit_streaks[habit_id] = streak
-                            else:
-                                habit_streaks[habit_id] = 0
-                        
-                        # For weekly habits - simplified streak calculation
-                        else:
-                            # Check if completed this week
-                            today = datetime.now()
-                            week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
-                            completed_this_week = any(date >= week_start for date in habit_logs["date"])
-                            
-                            if completed_this_week:
-                                # Count consecutive weeks (simplified)
-                                habit_streaks[habit_id] = 1
-                                # More complex streak logic could be implemented here
-                            else:
-                                habit_streaks[habit_id] = 0
-                    else:
-                        habit_streaks[habit_id] = 0
-                
-                # Add streaks to stats table
-                stats_table = habit_stats.copy()
-                stats_table["streak"] = stats_table["habit_id"].map(habit_streaks)
-                
-                # Format table for display
-                display_stats = stats_table[["name", "frequency", "completions", "streak"]]
-                display_stats.columns = ["Habit", "Frequency", "Completions", "Current Streak"]
-                
-                st.dataframe(display_stats, use_container_width=True)
-                
-                # Calendar heatmap for selected habit
-                st.subheader("Habit Calendar")
-                selected_habit = st.selectbox(
-                    "Select habit to view calendar", 
-                    [(h["id"], h["name"]) for h in st.session_state.habits],
-                    format_func=lambda x: x[1]
-                )
-                
-                if selected_habit:
-                    habit_id, habit_name = selected_habit
-                    
-                    # Get all logs for this habit
-                    habit_logs = logs_df[logs_df["habit_id"] == habit_id]
-                    
-                    if not habit_logs.empty:
-                        # Convert dates to datetime for calendar
-                        habit_logs["date"] = pd.to_datetime(habit_logs["date"])
-                        
-                        # Group by date and count
-                        calendar_data = habit_logs.groupby(habit_logs["date"].dt.date).size().reset_index()
-                        calendar_data.columns = ["date", "count"]
-                        
-                        # Create calendar heatmap
-                        fig = px.scatter(
-                            calendar_data,
-                            x=calendar_data["date"],
-                            y=[1] * len(calendar_data),  # Constant y value for all points
-                            size="count",
-                            color_discrete_sequence=["green"],
-                            title=f"Calendar for '{habit_name}'",
-                            labels={"x": "Date", "y": ""}
-                        )
-                        
-                        # Update layout
-                        fig.update_layout(
-                            yaxis=dict(
-                                showticklabels=False,
-                                showgrid=False,
-                            ),
-                            height=200
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info(f"No data available for '{habit_name}'")
-            else:
-                st.info(f"No data available for the selected period ({title})")
-        else:
-            st.info("No logs available yet. Start tracking your habits!")
-
-elif page == "One-time Activities":
-    st.header("One-time Activities")
+    st.subheader("One-time Activities")
+    if not st.session_state.habits["one_time"]:
+        st.info("No one-time activities added yet. Go to 'Add Habits' tab to add some!")
+    else:
+        for activity in st.session_state.habits["one_time"]:
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.write(activity)
+            with col2:
+                if st.button("✓", key=f"one_time_{activity}"):
+                    log_habit(activity, date_str)
+                    st.success(f"Logged {activity}")
+                    st.experimental_rerun()
     
-    # Add one-time activity
-    with st.form("new_activity_form"):
-        activity_name = st.text_input("Activity Name")
-        activity_date = st.date_input("Date Completed", value=datetime.now())
-        notes = st.text_area("Notes (Optional)")
+    # Add free-form tracking
+    st.subheader("Track Something Else")
+    with st.form("track_custom"):
+        custom_activity = st.text_input("Activity name")
+        custom_notes = st.text_area("Notes (optional)")
+        submitted = st.form_submit_button("Track")
         
-        submit_button = st.form_submit_button("Add Activity")
-        
-        if submit_button and activity_name:
-            new_activity = {
-                "id": len(st.session_state.activities) + 1,
-                "name": activity_name,
-                "date": activity_date.strftime("%Y-%m-%d"),
-                "notes": notes
-            }
-            st.session_state.activities.append(new_activity)
-            save_data()
-            st.success(f"Activity '{activity_name}' added successfully!")
-    
-    # Display activities
-    if st.session_state.activities:
-        st.subheader("Your Activities")
-        
-        # Convert to DataFrame for easier display
-        activities_df = pd.DataFrame(st.session_state.activities)
-        
-        # Sort by date (most recent first)
-        activities_df["date"] = pd.to_datetime(activities_df["date"])
-        activities_df = activities_df.sort_values("date", ascending=False)
-        
-        # Format for display
-        display_df = activities_df[["name", "date", "notes"]].copy()
-        display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
-        display_df.columns = ["Activity", "Date", "Notes"]
-        
-        st.dataframe(display_df, use_container_width=True)
-        
-        # Delete activity
-        activity_to_delete = st.selectbox(
-            "Select activity to delete", 
-            [(a["id"], a["name"]) for a in st.session_state.activities],
-            format_func=lambda x: x[1],
-            index=None
-        )
-        
-        if st.button("Delete Selected Activity") and activity_to_delete:
-            activity_id = activity_to_delete[0]
-            st.session_state.activities = [a for a in st.session_state.activities if a["id"] != activity_id]
-            save_data()
-            st.success(f"Activity '{activity_to_delete[1]}' deleted successfully!")
+        if submitted and custom_activity:
+            log_habit(custom_activity, date_str, custom_notes)
+            st.success(f"Logged: {custom_activity}")
             st.experimental_rerun()
+
+# Add habits tab
+with tabs[1]:
+    st.header("Add New Habits")
+    
+    # Add a new habit
+    st.subheader("Add a New Habit")
+    
+    with st.form("add_habit"):
+        new_habit = st.text_input("Habit name")
+        habit_type = st.selectbox("Habit type", ["Daily", "Weekly", "One-time Activity"])
+        submitted = st.form_submit_button("Add")
+        
+        if submitted and new_habit:
+            habit_type_lower = habit_type.lower().replace("-", "_")
+            if habit_type_lower == "daily":
+                st.session_state.habits["daily"].append(new_habit)
+            elif habit_type_lower == "weekly":
+                st.session_state.habits["weekly"].append(new_habit)
+            else:
+                st.session_state.habits["one_time"].append(new_habit)
+            
+            save_habits(st.session_state.habits)
+            st.success(f"Added {new_habit} as a {habit_type} habit!")
+            st.experimental_rerun()
+    
+    # Display and manage current habits
+    st.subheader("Current Habits")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Daily Habits**")
+        for i, habit in enumerate(st.session_state.habits["daily"]):
+            cols = st.columns([5, 1])
+            cols[0].write(habit)
+            if cols[1].button("🗑️", key=f"del_daily_{i}"):
+                st.session_state.habits["daily"].pop(i)
+                save_habits(st.session_state.habits)
+                st.experimental_rerun()
+    
+    with col2:
+        st.write("**Weekly Habits**")
+        for i, habit in enumerate(st.session_state.habits["weekly"]):
+            cols = st.columns([5, 1])
+            cols[0].write(habit)
+            if cols[1].button("🗑️", key=f"del_weekly_{i}"):
+                st.session_state.habits["weekly"].pop(i)
+                save_habits(st.session_state.habits)
+                st.experimental_rerun()
+    
+    st.write("**One-time Activities**")
+    for i, habit in enumerate(st.session_state.habits["one_time"]):
+        cols = st.columns([5, 1])
+        cols[0].write(habit)
+        if cols[1].button("🗑️", key=f"del_onetime_{i}"):
+            st.session_state.habits["one_time"].pop(i)
+            save_habits(st.session_state.habits)
+            st.experimental_rerun()
+
+# Analytics tab
+with tabs[2]:
+    st.header("Habit Analytics")
+    
+    logs = load_logs()
+    if not logs:
+        st.info("No habit data recorded yet. Start tracking habits to see analytics!")
     else:
-        st.info("No activities added yet. Add your first activity using the form above.")
+        # Convert logs to DataFrame for analysis
+        logs_df = pd.DataFrame(logs)
+        logs_df["date"] = pd.to_datetime(logs_df["date"])
+        
+        # Time period selection
+        time_period = st.selectbox("View analytics for", ["Week", "Month", "Year", "All Time"])
+        
+        # Filter data based on time period
+        today = datetime.datetime.now().date()
+        if time_period == "Week":
+            start_date = today - datetime.timedelta(days=today.weekday())
+            filtered_df = logs_df[logs_df["date"] >= pd.Timestamp(start_date)]
+            period_name = "This Week"
+        elif time_period == "Month":
+            start_date = datetime.date(today.year, today.month, 1)
+            filtered_df = logs_df[logs_df["date"] >= pd.Timestamp(start_date)]
+            period_name = "This Month"
+        elif time_period == "Year":
+            start_date = datetime.date(today.year, 1, 1)
+            filtered_df = logs_df[logs_df["date"] >= pd.Timestamp(start_date)]
+            period_name = "This Year"
+        else:
+            filtered_df = logs_df
+            period_name = "All Time"
+        
+        # Count by habit
+        if not filtered_df.empty:
+            habit_counts = filtered_df["habit"].value_counts().reset_index()
+            habit_counts.columns = ["Habit", "Completions"]
+            
+            # Show summary
+            st.subheader(f"Summary for {period_name}")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric("Total Habits Tracked", len(habit_counts))
+                
+            with col2:
+                st.metric("Total Completions", habit_counts["Completions"].sum())
+            
+            # Bar chart for habit completions
+            st.subheader(f"Habit Completions ({period_name})")
+            fig = px.bar(
+                habit_counts.sort_values("Completions", ascending=False).head(10),
+                x="Habit",
+                y="Completions",
+                color="Completions",
+                color_continuous_scale="blues"
+            )
+            fig.update_layout(xaxis_title="Habit", yaxis_title="Number of Completions")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Streak analysis
+            st.subheader("Habit Streaks & Consistency")
+            
+            # Get only habits that are daily
+            daily_habits = st.session_state.habits["daily"]
+            
+            if daily_habits:
+                # Filter for daily habits
+                daily_logs = filtered_df[filtered_df["habit"].isin(daily_habits)]
+                
+                # Group by habit and date to get daily completions
+                if not daily_logs.empty:
+                    # Count completions per day per habit
+                    daily_logs["date_only"] = daily_logs["date"].dt.date
+                    daily_completions = daily_logs.groupby(["habit", "date_only"]).size().reset_index()
+                    daily_completions.columns = ["Habit", "Date", "Count"]
+                    
+                    # Calculate consistency (days completed / total days in period)
+                    habits_consistency = {}
+                    date_range = pd.date_range(start=start_date, end=today)
+                    
+                    for habit in daily_habits:
+                        habit_days = daily_completions[daily_completions["Habit"] == habit]["Date"].nunique()
+                        consistency = (habit_days / len(date_range)) * 100 if len(date_range) > 0 else 0
+                        habits_consistency[habit] = consistency
+                    
+                    # Display consistency
+                    consistency_df = pd.DataFrame({
+                        "Habit": list(habits_consistency.keys()),
+                        "Consistency (%)": list(habits_consistency.values())
+                    })
+                    
+                    fig = px.bar(
+                        consistency_df.sort_values("Consistency (%)", ascending=False),
+                        x="Habit",
+                        y="Consistency (%)",
+                        color="Consistency (%)",
+                        color_continuous_scale="blues",
+                        range_y=[0, 100]
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Calendar heatmap for selected habit
+                    st.subheader("Habit Calendar")
+                    selected_habit = st.selectbox("Select habit", daily_habits)
+                    
+                    habit_dates = daily_logs[daily_logs["habit"] == selected_habit]["date_only"].unique()
+                    
+                    # Create a dataframe for calendar heatmap
+                    all_dates = pd.date_range(start=pd.Timestamp(start_date), end=pd.Timestamp(today))
+                    calendar_df = pd.DataFrame({"date": all_dates})
+                    calendar_df["day"] = calendar_df["date"].dt.day_name()
+                    calendar_df["completed"] = calendar_df["date"].dt.date.isin(habit_dates).astype(int)
+                    
+                    # Display in a calendar-like format
+                    fig = px.scatter(
+                        calendar_df,
+                        x=calendar_df["date"].dt.day_name(),
+                        y=calendar_df["date"].dt.week,
+                        color="completed",
+                        color_continuous_scale=["white", "blue"],
+                        title=f"Completion Calendar for {selected_habit}",
+                        labels={"color": "Completed", "y": "Week", "x": "Day"}
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No data available for daily habits in the selected period.")
+            else:
+                st.info("No daily habits defined yet.")
+            
+            # Weekly habits analysis
+            st.subheader("Weekly Habits Progress")
+            weekly_habits = st.session_state.habits["weekly"]
+            
+            if weekly_habits:
+                weekly_logs = filtered_df[filtered_df["habit"].isin(weekly_habits)]
+                
+                if not weekly_logs.empty:
+                    # Group by habit and week
+                    weekly_logs["week"] = weekly_logs["date"].dt.isocalendar().week
+                    weekly_logs["year"] = weekly_logs["date"].dt.isocalendar().year
+                    weekly_logs["year_week"] = weekly_logs["year"].astype(str) + "-W" + weekly_logs["week"].astype(str)
+                    
+                    # Count completions per week per habit
+                    weekly_completions = weekly_logs.groupby(["habit", "year_week"]).size().reset_index()
+                    weekly_completions.columns = ["Habit", "Week", "Count"]
+                    
+                    # Display weekly progress
+                    pivot_weekly = weekly_completions.pivot(index="Habit", columns="Week", values="Count").fillna(0)
+                    
+                    st.table(pivot_weekly)
+                else:
+                    st.info("No data available for weekly habits in the selected period.")
+            else:
+                st.info("No weekly habits defined yet.")
+        else:
+            st.info(f"No habit data recorded for {period_name}.")
+
+# Sidebar for settings and information
+with st.sidebar:
+    st.subheader("About")
+    st.write("This habit tracker app allows you to track daily and weekly habits, as well as one-time activities.")
+    st.write("Your data is stored in GitHub Gists, allowing you to access it from anywhere.")
+    
+    if initialize_github_connection():
+        if st.button("Clear All Data"):
+            if st.session_state.habits and (len(st.session_state.habits["daily"]) > 0 or 
+                                          len(st.session_state.habits["weekly"]) > 0 or 
+                                          len(st.session_state.habits["one_time"]) > 0):
+                if st.button("Are you sure? This will delete all your habits and logs.", key="confirm_delete"):
+                    # Reset data
+                    st.session_state.habits = {"daily": [], "weekly": [], "one_time": []}
+                    save_habits(st.session_state.habits)
+                    save_logs([])
+                    st.success("All data cleared!")
+                    st.experimental_rerun()
+            else:
+                st.info("No data to clear.")
+    
+    st.subheader("Export Data")
+    if initialize_github_connection():
+        if st.button("Download Habit Data as JSON"):
+            habits_json = json.dumps(st.session_state.habits, indent=2)
+            st.download_button(
+                label="Download Habits",
+                data=habits_json,
+                file_name="habits.json",
+                mime="application/json"
+            )
+        
+        if st.button("Download Logs as JSON"):
+            logs = load_logs()
+            logs_json = json.dumps(logs, indent=2)
+            st.download_button(
+                label="Download Logs",
+                data=logs_json,
+                file_name="logs.json",
+                mime="application/json"
+            )
