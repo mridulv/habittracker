@@ -10,3 +10,4 @@ env.bak/
 venv.bak/
 .streamlit/secrets.toml
 data/
+myenv/
